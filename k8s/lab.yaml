@@ -1,0 +1,93 @@
+# kind create cluster --name botlab
+# docker build -f Dockerfile.target -t botlab-target:dev . && docker build -f Dockerfile.runner -t botlab-runner:dev .
+# kind load docker-image botlab-target:dev botlab-runner:dev --name botlab
+# kubectl apply -f k8s/lab.yaml && kubectl -n botlab logs job/matrix -f
+apiVersion: v1
+kind: Namespace
+metadata: { name: botlab }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: redis, namespace: botlab }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: redis } }
+  template:
+    metadata: { labels: { app: redis } }
+    spec:
+      containers: [{ name: redis, image: "redis:7-alpine", ports: [{ containerPort: 6379 }] }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: redis, namespace: botlab }
+spec: { selector: { app: redis }, ports: [{ port: 6379 }] }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: postgres, namespace: botlab }
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector: { matchLabels: { app: postgres } }
+  template:
+    metadata: { labels: { app: postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_USER, value: lab }
+            - { name: POSTGRES_PASSWORD, value: lab }
+            - { name: POSTGRES_DB, value: lab }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data, subPath: pg }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], resources: { requests: { storage: 1Gi } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: postgres, namespace: botlab }
+spec: { selector: { app: postgres }, ports: [{ port: 5432 }] }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: target, namespace: botlab }
+spec:
+  replicas: 1   # rate limiting is shared through Redis, so this could scale
+  selector: { matchLabels: { app: target } }
+  template:
+    metadata: { labels: { app: target } }
+    spec:
+      containers:
+        - name: target
+          image: botlab-target:dev
+          imagePullPolicy: Never
+          env:
+            - { name: REDIS_URL, value: "redis://redis:6379/0" }
+            - { name: LAB_REQUIRE_CLIENT_HINTS, value: "0" }
+          ports: [{ containerPort: 8000 }]
+          readinessProbe: { httpGet: { path: /health, port: 8000 } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: target, namespace: botlab }
+spec: { selector: { app: target }, ports: [{ port: 8000 }] }
+---
+apiVersion: batch/v1
+kind: Job
+metadata: { name: matrix, namespace: botlab }
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: runner
+          image: botlab-runner:dev
+          imagePullPolicy: Never
+          args: ["matrix", "--clients", "fetch,axios,fetch_spoofed,impit,playwright,puppeteer"]
+          env:
+            - { name: TARGET_URL, value: "http://target:8000" }
+            - { name: DATABASE_URL, value: "postgres://lab:lab@postgres:5432/lab" }
+            - { name: REDIS_URL, value: "redis://redis:6379/0" }

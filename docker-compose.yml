@@ -1,0 +1,35 @@
+# docker compose up -d --build target postgres redis proxy1 proxy2 proxy3
+# docker compose run --rm runner matrix
+# docker compose run --rm runner rate --limit 10 --window 10 --proxies http://proxy1:8888,http://proxy2:8888,http://proxy3:8888
+services:
+  target:
+    build: { context: ., dockerfile: Dockerfile.target }
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT: "10"
+      RATE_WINDOW: "10"
+      LAB_REQUIRE_CLIENT_HINTS: "0"   # Chrome omits client hints on non-localhost http origins
+    ports: ["8000:8000"]
+    depends_on: [redis]
+  redis:
+    image: redis:7-alpine
+  postgres:
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: lab, POSTGRES_PASSWORD: lab, POSTGRES_DB: lab }
+    volumes: [pgdata:/var/lib/postgresql/data]
+    ports: ["5432:5432"]
+  proxy1: &proxy
+    image: vimagick/tinyproxy
+    command: ["tinyproxy", "-d"]
+    volumes: ["./proxy/tinyproxy.conf:/etc/tinyproxy/tinyproxy.conf:ro"]
+  proxy2: *proxy
+  proxy3: *proxy
+  runner:
+    build: { context: ., dockerfile: Dockerfile.runner }
+    profiles: [run]
+    environment:
+      TARGET_URL: http://target:8000
+      DATABASE_URL: postgres://lab:lab@postgres:5432/lab
+      REDIS_URL: redis://redis:6379/0
+    depends_on: [target, postgres]
+volumes: { pgdata: {} }

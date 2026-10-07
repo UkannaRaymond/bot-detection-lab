@@ -1,0 +1,9 @@
+# Playwright image: Node, Chromium and system libs, version-matched to the playwright dependency.
+FROM mcr.microsoft.com/playwright:v1.56.1-jammy
+WORKDIR /app
+COPY package*.json tsconfig.json ./
+RUN npm ci
+RUN npx camoufox-js fetch || echo "camoufox binary unavailable; that client will report ERROR"
+COPY src ./src
+ENTRYPOINT ["npx", "tsx", "src/lab/cli.ts"]
+CMD ["matrix", "--clients", "fetch,axios,fetch_spoofed,impit,playwright,puppeteer,camoufox"]
