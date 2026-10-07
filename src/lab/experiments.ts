@@ -1,10 +1,12 @@
 /** Rule-matrix experiments: each client x each rule alone, plus all rules together. */
 import { makeClient } from "./clients.js";
+import { assertTargetReady } from "./preflight.js";
 import { predictedBlocked, PREDICTIONS, RULES } from "./predictions.js";
 import { openDb, saveExperiment, type Observation } from "./store.js";
 
 export async function runMatrix(opts: { target: string; clients: string[]; runs: number; browserRuns: number; log?: (s: string) => void }): Promise<string> {
   const log = opts.log ?? console.log;
+  await assertTargetReady(opts.target, RULES);
   const db = await openDb();
   const batch = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 14) + "-" + Math.random().toString(16).slice(2, 6);
   for (const name of opts.clients) {

@@ -15,6 +15,7 @@ export const STATIC_RULES = [
   "header_order",
   "cookie_challenge",
   "webdriver_check",
+  "headless_signals",
 ] as const;
 export const ALL_RULES = [...STATIC_RULES, "rate_limit", "tls_fingerprint"] as const;
 export type RuleName = (typeof ALL_RULES)[number];
@@ -49,6 +50,19 @@ const BOT_UA_TOKENS = [
 const CHROME_ORDER = ["sec-ch-ua", "user-agent", "accept", "accept-encoding", "accept-language"];
 const FIREFOX_ORDER = ["user-agent", "accept", "accept-language", "accept-encoding"];
 const COOKIE_NAME = "__lab_clr";
+const SIGNALS_COOKIE = "__lab_sig";
+const JS_RULES = ["cookie_challenge", "webdriver_check", "headless_signals"];
+
+/** What the challenge page reports about the JS environment. */
+export interface Signals {
+  p: number; // navigator.plugins.length
+  c: number; // 1 when window.chrome exists
+  l: string[]; // navigator.languages
+  pl: string; // navigator.platform
+  w: number; // screen.width  (recorded only; screen size is too easy to overfit on)
+  h: number; // screen.height
+  tz: string; // timezone       (recorded only)
+}
 
 function inOrder(names: string[], expected: string[]): boolean {
   const idx = expected.filter((n) => names.includes(n)).map((n) => names.indexOf(n));
@@ -126,6 +140,38 @@ export function createTarget(opts: TargetOptions = {}): Server & { close(): Serv
     return ja3.size && !ja3.has(h) ? `JA3 ${h} not in allowlist` : null;
   };
 
+  function parseSignals(c: Ctx): Signals | null {
+    const raw = c.cookies.get(SIGNALS_COOKIE);
+    if (!raw) return null;
+    try {
+      const d = JSON.parse(decodeURIComponent(raw)) as Partial<Signals>;
+      if (typeof d.p !== "number" || !Array.isArray(d.l) || typeof d.pl !== "string") return null;
+      return { p: d.p, c: Number(d.c) || 0, l: d.l.map(String), pl: d.pl, w: Number(d.w) || 0, h: Number(d.h) || 0, tz: String(d.tz ?? "") };
+    } catch { return null; }
+  }
+
+  /** Cross-checks JS-visible browser state against the UA and the request headers. */
+  const headlessSignals = (c: Ctx, sig: Signals | null): Verdict => {
+    if (!sig) return "signals cookie missing or malformed";
+    const ua = c.h.get("user-agent") ?? "";
+    const problems: string[] = [];
+    if (ua.includes("Chrome/")) {
+      if (sig.p === 0) problems.push("Chrome UA but navigator.plugins is empty (real Chrome lists its PDF viewers)");
+      if (!sig.c) problems.push("Chrome UA but window.chrome is missing");
+    }
+    if (!sig.l.length) problems.push("navigator.languages is empty");
+    const header = c.h.get("accept-language");
+    if (!header && sig.l.length) {
+      problems.push(`navigator.languages is [${sig.l}] but no Accept-Language header was sent`);
+    } else if (header && sig.l[0]) {
+      const first = (header.split(",")[0] ?? "").split(";")[0]!.trim().toLowerCase();
+      if (first !== sig.l[0].toLowerCase()) problems.push(`Accept-Language starts with '${first}' but navigator.languages[0] is '${sig.l[0]}'`);
+    }
+    const platformFor = ua.includes("Windows") ? "Win" : ua.includes("Macintosh") ? "Mac" : ua.includes("Linux") || ua.includes("X11") ? "Linux" : null;
+    if (platformFor && !sig.pl.includes(platformFor)) problems.push(`UA says ${platformFor} but navigator.platform is '${sig.pl}'`);
+    return problems.length ? problems.join("; ") : null;
+  };
+
   const simple: Record<string, (c: Ctx) => Verdict> = {
     ua_blocklist: uaBlocklist,
     header_consistency: headerConsistency,
@@ -146,7 +192,12 @@ export function createTarget(opts: TargetOptions = {}): Server & { close(): Serv
 
   const challengeHtml = (token: string) =>
     `<!doctype html><title>Checking your browser</title><script>` +
-    `var wd=navigator.webdriver?"1":"0";document.cookie="${COOKIE_NAME}=${token}."+wd+"; path=/";location.reload();</script>`;
+    `var wd=navigator.webdriver?"1":"0";` +
+    `var s={p:navigator.plugins.length,c:typeof window.chrome!=="undefined"?1:0,l:Array.from(navigator.languages||[]),` +
+    `pl:navigator.platform,w:screen.width,h:screen.height,tz:Intl.DateTimeFormat().resolvedOptions().timeZone};` +
+    `document.cookie="${COOKIE_NAME}=${token}."+wd+"; path=/";` +
+    `document.cookie="${SIGNALS_COOKIE}="+encodeURIComponent(JSON.stringify(s))+"; path=/";` +
+    `location.reload();</script>`;
 
   function resolveRules(spec: string | null): string[] {
     const s = spec ?? opts.defaultRules ?? "";
@@ -187,15 +238,18 @@ export function createTarget(opts: TargetOptions = {}): Server & { close(): Serv
     }
 
     let needChallenge = false;
-    if (active.includes("cookie_challenge") || active.includes("webdriver_check")) {
+    const jsActive = JS_RULES.filter((n) => active.includes(n));
+    if (jsActive.length) {
       const cl = parseClearance(ctx);
       if (!cl || !cl.valid) {
         needChallenge = true;
-        for (const n of ["cookie_challenge", "webdriver_check"]) {
-          if (active.includes(n)) triggered.push([n, "no valid clearance cookie (JavaScript not executed)"]);
+        for (const n of jsActive) triggered.push([n, "no valid clearance cookie (JavaScript not executed)"]);
+      } else {
+        if (cl.webdriver && active.includes("webdriver_check")) triggered.push(["webdriver_check", "navigator.webdriver was true"]);
+        if (active.includes("headless_signals")) {
+          const reason = headlessSignals(ctx, parseSignals(ctx));
+          if (reason) triggered.push(["headless_signals", reason]);
         }
-      } else if (cl.webdriver && active.includes("webdriver_check")) {
-        triggered.push(["webdriver_check", "navigator.webdriver was true"]);
       }
     }
 
@@ -209,7 +263,7 @@ export function createTarget(opts: TargetOptions = {}): Server & { close(): Serv
     if (!triggered.length) return send(res, 200, { allowed: true, ip: ctx.ip, rules: active }, headers);
 
     // The JS challenge is only served when no static fingerprint rule already condemned the request.
-    const onlyJsRules = names.every((n) => n === "cookie_challenge" || n === "webdriver_check");
+    const onlyJsRules = names.every((n) => JS_RULES.includes(n));
     if (needChallenge && onlyJsRules) {
       return send(res, 403, challengeHtml(makeToken(ctx.ip, ctx.h.get("user-agent") ?? "")), headers);
     }
@@ -219,7 +273,7 @@ export function createTarget(opts: TargetOptions = {}): Server & { close(): Serv
 
   const server = createServer((req, res) => {
     const url = new URL(req.url ?? "/", "http://lab");
-    if (url.pathname === "/health") return send(res, 200, { ok: true });
+    if (url.pathname === "/health") return send(res, 200, { ok: true, rules: ALL_RULES });
     if (url.pathname === "/echo") return send(res, 200, { ip: buildCtx(req).ip, headers: buildCtx(req).headers });
     if (url.pathname === "/protected") {
       protectedRoute(req, res, url).catch((e) => send(res, 500, { error: String(e) }));

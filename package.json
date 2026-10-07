@@ -10,7 +10,9 @@
     "target": "tsx src/target/server.ts",
     "lab": "tsx src/lab/cli.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "dev": "pnpm run lab matrix --clients fetch,axios,fetch_spoofed,impit,playwright,puppeteer,camoufox --runs 5 --browser-runs 3",
+    "report": "pnpm run lab report > results/matrix.md"
   },
   "dependencies": {
     "axios": "^1.20.0",
